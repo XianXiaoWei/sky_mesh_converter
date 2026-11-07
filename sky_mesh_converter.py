@@ -5,6 +5,7 @@ Standard library only. Little endian .mesh versions 25..32.
 """
 from __future__ import annotations
 import argparse, base64, hashlib, json, math, os, re, struct, sys, tempfile, zlib
+import shutil, unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -1126,6 +1127,8 @@ def import_glb(g, extra_only=False):
         and all("skin" not in n for i, n in selected)
         else []
     )
+    has_skin = any(n.get("skin") is not None for _, n in selected)
+    mixed_rigid_nodes = []
     skin_id = None
     mesh_world = identity()
     for i, n in selected:
@@ -1177,6 +1180,39 @@ def import_glb(g, extra_only=False):
             if rigid_nodes:
                 attrs["JOINTS_0"] = [(rigid_nodes.index(i), 0, 0, 0)] * count
                 attrs["WEIGHTS_0"] = [(1.0, 0.0, 0.0, 0.0)] * count
+            elif has_skin:
+                skin_attrs = any(k.startswith(("JOINTS_", "WEIGHTS_")) for k in attrs)
+                if sk is not None and skin_attrs:
+                    require(
+                        "JOINTS_0" in attrs and "WEIGHTS_0" in attrs,
+                        "蒙皮缺少JOINTS_0/WEIGHTS_0",
+                    )
+                    joint_count = len(d["skins"][sk]["joints"])
+                    require(
+                        all(
+                            len(row) == 4
+                            and all(
+                                isinstance(j, int) and 0 <= j < joint_count for j in row
+                            )
+                            for row in attrs["JOINTS_0"]
+                        )
+                        and all(len(row) == 4 for row in attrs["WEIGHTS_0"]),
+                        "蒙皮分量数量错误或JOINTS_0超出GLB蒙皮范围",
+                    )
+                else:
+                    # An unskinned primitive keeps its own node transform. A rigid
+                    # joint also preserves attachments and independent animation.
+                    if i not in mixed_rigid_nodes:
+                        mixed_rigid_nodes.append(i)
+                    attrs = {
+                        k: v
+                        for k, v in attrs.items()
+                        if not k.startswith(("JOINTS_", "WEIGHTS_"))
+                    }
+                    # Negative markers exist only internally; input joint indices
+                    # were validated above before these markers were introduced.
+                    attrs["JOINTS_0"] = [(-i - 2,) * 4] * count
+                    attrs["WEIGHTS_0"] = [(1.0, 0.0, 0.0, 0.0)] * count
             require(
                 all(len(rows) == count for rows in attrs.values()), "属性顶点数量不一致"
             )
@@ -1312,7 +1348,41 @@ def import_glb(g, extra_only=False):
                     "node": j,
                 }
             )
+        animated_nodes = {
+            ch.get("target", {}).get("node")
+            for clip in d.get("animations", [])
+            for ch in clip.get("channels", [])
+        }
+        attached_or_animated = set(original_joints) | animated_nodes
+        moving_rigid_nodes = []
+        for j in mixed_rigid_nodes:
+            p = j
+            while p >= 0:
+                if p in attached_or_animated:
+                    moving_rigid_nodes.append(j)
+                    break
+                p = parents.get(p, -1)
+        # World-static geometry uses palette slot 0, leaving all 255 bone slots
+        # available. Only attachments/animated rigid parts need an extra bone.
+        rigid_mapping = {j: len(bones) + k for k, j in enumerate(moving_rigid_nodes)}
+        hierarchy_mapping = {**mapping, **rigid_mapping}
+        for j in moving_rigid_nodes:
+            p = parents.get(j, -1)
+            while p >= 0 and p not in hierarchy_mapping:
+                p = parents.get(p, -1)
+            bones.append(
+                {
+                    "name": f"SKY_rigid_mesh_{j}",
+                    "parent": hierarchy_mapping.get(p, -1),
+                    "matrix": inverse(worlds[j]),
+                    "node": j,
+                }
+            )
+        require(len(bones) <= 255, "游戏单mesh最多255根可索引骨骼（含刚性部件）")
         remap_joints = {i: mapping.get(j, -1) for i, j in enumerate(original_joints)}
+        remap_joints.update(
+            {-j - 2: rigid_mapping.get(j, -1) for j in mixed_rigid_nodes}
+        )
         for geom in groups.values():
             if "JOINTS_0" in geom:
                 require(
@@ -1517,7 +1587,8 @@ def build_lod(geom, version, flags, bones, reference=None):
             groups = reference.groups
             counts = reference.counts
             third = reference.third
-            hs = reference.has_secondary
+            # Versions 25..28 always contain this stream, without a presence flag.
+            hs = int(version < 29 or reference.has_secondary)
             if reference.idx32 != idx32:
                 for key in (
                     "secondary_indices",
@@ -1828,6 +1899,27 @@ def source_mesh(g):
     return m, e
 
 
+def source_lods_unchanged(g, reference):
+    # Legacy geometryHash values omit LOD extras. Compare against the embedded
+    # source as well so old GLBs remain eligible for exact byte restoration.
+    nodes = g.doc.get("nodes", [])
+    if len(nodes) < len(reference.lods):
+        return False
+    for i, node in enumerate(nodes):
+        extras = node.get("extras", {})
+        actual = {k: extras[k] for k in ("sky_lod", "sky_distance") if k in extras}
+        expected = {}
+        if i < len(reference.lods):
+            distance = reference.lods[i].distance
+            expected = {
+                "sky_lod": i,
+                "sky_distance": distance if math.isfinite(distance) else "inf",
+            }
+        if actual != expected:
+            return False
+    return True
+
+
 def convert_glb(g, filename, version, flags=None, compress=True, fps=None):
     ref, meta = source_mesh(g)
     flags = set(
@@ -1836,7 +1928,12 @@ def convert_glb(g, filename, version, flags=None, compress=True, fps=None):
         else split_name(filename)[1] if flags is None else flags
     )
     require(flags <= set(FLAG_ORDER), f"未知参数: {flags-set(FLAG_ORDER)}")
-    same = bool(ref and meta and glb_fingerprint(g.doc, g.bin) == meta["geometryHash"])
+    same = bool(
+        ref
+        and meta
+        and glb_fingerprint(g.doc, g.bin) == meta["geometryHash"]
+        and source_lods_unchanged(g, ref)
+    )
     if (
         same
         and version == ref.version
@@ -1874,6 +1971,7 @@ def convert_glb(g, filename, version, flags=None, compress=True, fps=None):
         reuse = bool(
             ref
             and ref.animated
+            and len(bones) == len(read_skeleton(ref.skeleton)["bones"])
             and fps is None
             and (
                 (not has_animations and not meta.get("animationClipsExported"))
@@ -2018,11 +2116,306 @@ def convert_file(path, output=None, version=32, flags=None, compress=True, fps=N
     return out
 
 
-def flags_menu(g, filename):
+def _menu_color(text, color="white", bold=False, enabled=None):
+    if enabled is None:
+        enabled = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+    if not enabled:
+        return text
+    code = {"white": "37", "green": "32", "red": "31"}[color]
+    return f'\x1b[{"1;" if bold else ""}{code}m{text}\x1b[0m'
+
+
+def _menu_width(text):
+    return sum(
+        (
+            0
+            if unicodedata.combining(ch)
+            else 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        )
+        for ch in text
+    )
+
+
+def _menu_clip(text, width):
+    if _menu_width(text) <= width:
+        return text
+    out = ""
+    for ch in text:
+        if _menu_width(out + ch) > max(0, width - 1):
+            break
+        out += ch
+    return out + "…" if width else ""
+
+
+def _menu_pad(text, width):
+    text = _menu_clip(text, width)
+    return text + " " * max(0, width - _menu_width(text))
+
+
+def _menu_wrap(text, width, count=2):
+    lines, current = [], ""
+    for ch in text:
+        if _menu_width(current + ch) > width and current:
+            lines.append(current)
+            current = ""
+            if len(lines) == count - 1:
+                return lines + [_menu_clip(text[sum(len(x) for x in lines) :], width)]
+        current += ch
+    return lines + [current]
+
+
+class _MenuTerminal:
+    """ANSI font styling and optional cbreak input, with a plain-input fallback."""
+
+    def __init__(self):
+        self.raw = False
+        self.color = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+        self.row_map = {}
+        self.size = shutil.get_terminal_size((88, 28))
+
+    def __enter__(self):
+        if (
+            os.name == "posix"
+            and sys.stdin.isatty()
+            and sys.stdout.isatty()
+            and os.environ.get("TERM") != "dumb"
+        ):
+            import termios, tty
+
+            self.fd = sys.stdin.fileno()
+            self.saved = termios.tcgetattr(self.fd)
+            try:
+                tty.setcbreak(self.fd)
+                self.raw = True
+                sys.stdout.write("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1003h\x1b[?1006h")
+                sys.stdout.flush()
+            except BaseException:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+                self.raw = False
+                raise
+        return self
+
+    def __exit__(self, *args):
+        if self.raw:
+            import termios
+
+            try:
+                sys.stdout.write("\x1b[?1003l\x1b[?1006l\x1b[0m\x1b[?25h\x1b[?1049l")
+                sys.stdout.flush()
+            finally:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def draw(self, title, rows, focus, controls, message="", error=False, buffer=""):
+        self.size = shutil.get_terminal_size((88, 28))
+        self.width = max(12, min(94, self.size.columns - 8))
+        page_size = max(1, self.size.lines - 12)
+        start = focus // page_size * page_size
+        visible = rows[start : start + page_size]
+        paint = lambda s, color="white", bold=False: _menu_color(
+            s, color, bold, self.color
+        )
+        lines = [
+            "  " + paint(_menu_clip("SKY  ·  Mesh ↔ GLB", self.width), bold=True),
+            "  " + paint(_menu_clip(title, self.width), bold=True),
+        ]
+        lines.append("  ┌" + "─" * (self.width + 2) + "┐")
+        self.row_map = {}
+        for i, row in enumerate(visible, start):
+            color = (
+                "red"
+                if row.get("locked")
+                else "green" if row.get("selected") else "white"
+            )
+            mark = "●" if row.get("selected") else "○"
+            label_width = min(16, max(5, self.width - 22))
+            text = f'{"›" if i == focus else " "} {i + 1:2}. {mark} {_menu_pad(row["label"], label_width)} {row.get("status", "")}'
+            self.row_map[len(lines) + 1] = i
+            lines.append(
+                "  │ " + paint(_menu_pad(text, self.width), color, i == focus) + " │"
+            )
+        lines.append("  └" + "─" * (self.width + 2) + "┘")
+        detail = rows[focus].get("description", "")
+        lines.extend("  " + paint(s) for s in _menu_wrap(detail, self.width))
+        lines.extend("  " + paint(_menu_clip(s, self.width)) for s in controls)
+        if len(rows) > page_size:
+            message = (
+                message
+                or f"显示 {start + 1}–{start + len(visible)} / {len(rows)} 项；上下键或滚轮翻页"
+            )
+        lines.append(
+            "  "
+            + paint(_menu_clip(message or " ", self.width), "red" if error else "white")
+        )
+        if self.raw:
+            lines.append(
+                "  "
+                + paint(
+                    "输入 › " + _menu_clip(buffer, max(1, self.width - 7)), bold=True
+                )
+            )
+            sys.stdout.write("\x1b[H" + "\n".join(lines) + "\x1b[J")
+            sys.stdout.flush()
+        else:
+            print("\n" + "\n".join(lines))
+
+    def read_event(self):
+        if not self.raw:
+            return "line", input("  输入 › ")
+        import select
+
+        while not select.select([self.fd], [], [], 0.2)[0]:
+            if shutil.get_terminal_size((88, 28)) != self.size:
+                return "resize", None
+        ch = os.read(self.fd, 1)
+        if not ch or ch == b"\x04":
+            raise EOFError
+        if ch == b"\x03":
+            raise KeyboardInterrupt
+        if ch in (b"\r", b"\n"):
+            return "enter", None
+        if ch == b" ":
+            return "space", None
+        if ch in (b"\x7f", b"\x08"):
+            return "backspace", None
+        if ch == b"\t":
+            return "down", None
+        if ch != b"\x1b":
+            return "char", ch.decode("ascii", "replace")
+        sequence = b""
+        if select.select([self.fd], [], [], 0.04)[0]:
+            sequence += os.read(self.fd, 1)
+        if sequence in (b"[", b"O"):
+            while len(sequence) < 64 and select.select([self.fd], [], [], 0.04)[0]:
+                part = os.read(self.fd, 1)
+                sequence += part
+                if 0x40 <= part[0] <= 0x7E:
+                    break
+        key = {
+            b"[A": "up",
+            b"OA": "up",
+            b"[B": "down",
+            b"OB": "down",
+            b"[C": "down",
+            b"[D": "up",
+            b"[H": "home",
+            b"[1~": "home",
+            b"OH": "home",
+            b"[F": "end",
+            b"[4~": "end",
+            b"OF": "end",
+            b"[5~": "page_up",
+            b"[6~": "page_down",
+        }.get(sequence)
+        if key:
+            return key, None
+        mouse = re.fullmatch(rb"\[<(\d+);(\d+);(\d+)([Mm])", sequence)
+        if mouse:
+            button, x, y = (int(v) for v in mouse.groups()[:3])
+            return "mouse", (button, x, y, mouse.group(4) == b"M")
+        return "escape", None
+
+    def navigate(self, event, focus, total):
+        kind, value = event
+        if kind in ("up", "down", "page_up", "page_down"):
+            step = max(1, self.size.lines - 12) if kind.startswith("page") else 1
+            target = focus + (-step if kind in ("up", "page_up") else step)
+            return (
+                min(total - 1, max(0, target))
+                if kind.startswith("page")
+                else target % total
+            ), False
+        if kind == "home":
+            return 0, False
+        if kind == "end":
+            return total - 1, False
+        if kind == "mouse":
+            button, x, y, pressed = value
+            if button & 64:
+                return (
+                    min(total - 1, max(0, focus + (-1 if button & 1 == 0 else 1))),
+                    False,
+                )
+            if 3 <= x <= self.width + 6 and y in self.row_map:
+                return self.row_map[y], pressed and button & 35 == 0
+        return focus, False
+
+
+def _menu_choice(
+    title, labels, descriptions, default=0, back="q", values=None, message=""
+):
+    focus, buffer = default, ""
+    with _MenuTerminal() as ui:
+        while True:
+            rows = [
+                {
+                    "label": label,
+                    "selected": i == focus,
+                    "status": "当前选择" if i == focus else "",
+                    "description": descriptions[i],
+                }
+                for i, label in enumerate(labels)
+            ]
+            ui.draw(
+                title,
+                rows,
+                focus,
+                [
+                    "↑ / ↓ 定位  ·  输入编号或版本值",
+                    f"回车确认  ·  {back} {'返回参数表' if back == 'b' else '退出'}",
+                ],
+                message,
+                error=bool(message),
+                buffer=buffer,
+            )
+            event = ui.read_event()
+            kind, value = event
+            old_focus = focus
+            focus, clicked = ui.navigate(event, focus, len(rows))
+            if (
+                kind in ("up", "down", "home", "end", "page_up", "page_down")
+                or clicked
+                or focus != old_focus
+            ):
+                buffer = ""
+            if kind == "line":
+                return value.strip()
+            if kind == "escape":
+                return back
+            if kind == "enter":
+                return buffer.strip() or str(focus + 1)
+            if kind == "backspace":
+                buffer = buffer[:-1]
+            elif kind == "char":
+                if value.lower() == back and not buffer:
+                    return back
+                if value in "0123456789xXabcdefABCDEF":
+                    buffer += value
+                else:
+                    message = (
+                        "请输入菜单编号" if values is None else "请输入菜单编号或版本号"
+                    )
+            if buffer:
+                try:
+                    number = (
+                        int(buffer, 0)
+                        if buffer.lower().startswith("0x")
+                        else int(buffer)
+                    )
+                    if buffer.isdigit() and 1 <= number <= len(rows):
+                        focus = number - 1
+                    elif values and number in values:
+                        focus = values.index(number)
+                except ValueError:
+                    pass
+
+
+def flags_menu(g, filename, initial=None):
     ref, meta = source_mesh(g)
     geoms, bones, animations = import_glb(g)
     selected = detect_flags(ref) if ref else split_name(filename)[1]
     selected = set(selected)
+    if initial is not None:
+        selected = set(initial)
     locked = {}
     if bones:
         keep_legacy = (
@@ -2067,45 +2460,135 @@ def flags_menu(g, filename):
     unavailable = (REFERENCE_ONLY | {"CompOcc"}) - (detect_flags(ref) if ref else set())
     for f in unavailable:
         selected.discard(f)
-    while True:
-        print("\n参数多选（输入编号切换，多个编号用空格；回车进入版本选择）")
-        for i, f in enumerate(FLAG_ORDER, 1):
-            mark = "●" if f in selected else "○"
-            tag = (
-                " [原始数据保留，当前不可切换]"
-                if f in locked and f in REFERENCE_ONLY
-                else (
-                    " [结构固定]"
-                    if f in locked
-                    else " [需要原始数据，当前不可选]" if f in unavailable else ""
-                )
-            )
-            print(f"{i:2}. {mark} {f}: {FLAG_DESCRIPTIONS[f]}{tag}")
-        answer = input("选择: ").strip()
-        if not answer:
-            return selected
+    focus = next(
+        (
+            i
+            for i, f in enumerate(FLAG_ORDER)
+            if f not in locked and f not in unavailable
+        ),
+        0,
+    )
+    buffer, message, error = "", "", False
+
+    def toggle(answer):
+        nonlocal focus, message, error
         try:
-            items = [int(x) for x in re.split(r"[ ,，]+", answer)]
+            items = [int(x) for x in re.split(r"[ ,，]+", answer.strip())]
         except ValueError:
-            print("请输入菜单编号")
-            continue
+            message, error = "请输入菜单编号；只有 y 确认后进入版本选择", True
+            return
+        notices = []
+        error = False
         for i in items:
             if not 1 <= i <= len(FLAG_ORDER):
-                print("无效编号:", i)
+                notices.append(f"无效编号：{i}")
+                error = True
                 continue
-            f = FLAG_ORDER[i - 1]
+            focus = i - 1
+            f = FLAG_ORDER[focus]
             if f in locked or f in unavailable:
-                print(f, "当前不能切换")
-                continue
-            if f in selected:
-                selected.remove(f)
+                notices.append(f"{f} 已锁定，不能修改")
+                error = True
             else:
-                selected.add(f)
+                if f in selected:
+                    selected.remove(f)
+                else:
+                    selected.add(f)
+                notices.append(f'{f} {"已选择" if f in selected else "已取消"}')
+        message = "；".join(notices)
+
+    with _MenuTerminal() as ui:
+        while True:
+            rows = []
+            for f in FLAG_ORDER:
+                status = (
+                    "来源保留 · 锁定"
+                    if f in locked and f in REFERENCE_ONLY
+                    else (
+                        "结构固定 · 锁定"
+                        if f in locked
+                        else (
+                            "无来源 · 锁定"
+                            if f in unavailable
+                            else "已选择" if f in selected else "未选择"
+                        )
+                    )
+                )
+                rows.append(
+                    {
+                        "label": f,
+                        "selected": f in selected,
+                        "locked": f in locked or f in unavailable,
+                        "status": status,
+                        "description": f"{f}：{FLAG_DESCRIPTIONS[f]}",
+                    }
+                )
+            ui.draw(
+                "GLB → mesh  /  参数多选",
+                rows,
+                focus,
+                [
+                    "编号 + 空格/回车切换  ·  ↑↓定位，空格切换",
+                    "回车只刷新  ·  y 确认  ·  白色未选 / 绿色已选 / 红色锁定",
+                ],
+                message,
+                error,
+                buffer,
+            )
+            event = ui.read_event()
+            kind, value = event
+            old_focus = focus
+            focus, clicked = ui.navigate(event, focus, len(rows))
+            if (
+                kind in ("up", "down", "home", "end", "page_up", "page_down")
+                or clicked
+                or focus != old_focus
+            ):
+                buffer = ""
+            if clicked:
+                toggle(str(focus + 1))
+            if kind == "line":
+                if value.strip().lower() == "y":
+                    return selected
+                if value.strip():
+                    toggle(value)
+                elif value and " " in value:
+                    toggle(str(focus + 1))
+                else:
+                    message, error = "状态已刷新；输入 y 才会进入版本选择", False
+            elif kind == "char" and value.lower() == "y":
+                if buffer:
+                    toggle(buffer)
+                    buffer = ""
+                    if error:
+                        continue
+                return selected
+            elif kind in ("enter", "space"):
+                if buffer:
+                    toggle(buffer)
+                    buffer = ""
+                elif kind == "space":
+                    toggle(str(focus + 1))
+                else:
+                    message, error = "状态已刷新；按 y 才会进入版本选择", False
+            elif kind == "backspace":
+                buffer = buffer[:-1]
+            elif kind == "char":
+                if value.isdigit() or value == ",":
+                    buffer += value
+                    if buffer.isdigit() and 1 <= int(buffer) <= len(rows):
+                        focus = int(buffer) - 1
+                else:
+                    message, error = "请输入编号，用空格切换；按 y 确认", True
+            elif kind == "escape":
+                buffer = ""
+                message, error = "已清空输入；按 y 确认参数", False
 
 
 def version_menu(flags):
+    notice = ""
     while True:
-        print("\n版本单选（回车默认0x20；b返回参数表）")
+        labels, descriptions = [], []
         for i, v in enumerate(VERSIONS, 1):
             note = (
                 "（旧布局，32位索引，不支持压缩属性）"
@@ -2116,8 +2599,17 @@ def version_menu(flags):
                     else "（APK全部样本版本）" if v == 32 else ""
                 )
             )
-            print(f"{i}. 0x{v:02X} / {v} {note}")
-        a = input("版本: ").strip()
+            labels.append(f"0x{v:02X} / {v}")
+            descriptions.append(f"0x{v:02X}：{note or '支持外层LZ4与可选属性'}")
+        a = _menu_choice(
+            "GLB → mesh  /  版本单选",
+            labels,
+            descriptions,
+            7,
+            "b",
+            list(VERSIONS),
+            notice,
+        )
         if a.lower() == "b":
             return None
         try:
@@ -2131,37 +2623,52 @@ def version_menu(flags):
                 )
             )
         except (ValueError, IndexError):
-            print("无效版本")
+            notice = "无效版本，请输入菜单编号或 0x19–0x20"
             continue
         if v not in VERSIONS:
-            print("版本不受该so正常支持")
+            notice = "版本不受该 so 正常支持，请选择 0x19–0x20"
             continue
         if v < 29 and flags & {"ZipPos", "ZipUvs", "StripNorm"}:
-            print("先取消ZipPos/ZipUvs/StripNorm才能使用这个版本")
+            notice = "请先返回参数表取消 ZipPos / ZipUvs / StripNorm"
             continue
         return v
 
 
 def interactive_menu():
-    print("Sky mesh ↔ GLB 转换器（libBootloader.so 365939）")
+    notice = ""
     while True:
-        print("\n1. glb转mesh\n2. mesh转glb\n输入q退出")
-        choice = input("选择: ").strip().lower()
+        choice = _menu_choice(
+            "转换菜单  /  libBootloader.so 365939",
+            ["glb转mesh", "mesh转glb"],
+            [
+                "GLB → mesh：选择参数，确认后选择目标版本",
+                "mesh → GLB：自动识别版本与数据特征",
+            ],
+            message=notice,
+        ).lower()
         if choice in ("q", "quit", "退出"):
             return
         if choice not in ("1", "2"):
-            print("请输入1或2")
+            notice = "请输入 1 或 2，输入 q 退出"
             continue
+        notice = ""
         try:
-            path = Path(input("输入文件完整路径: ").strip().strip("\"'"))
+            print(
+                _menu_color(
+                    f"\n  当前任务：{'GLB → mesh' if choice == '1' else 'mesh → GLB'}",
+                    bold=True,
+                )
+            )
+            path = Path(input("  文件路径 › ").strip().strip("\"'"))
             require(
                 path.suffix.lower() == (".glb" if choice == "1" else ".mesh"),
                 "文件类型与菜单不一致",
             )
             if choice == "1":
                 g = Glb(path.read_bytes())
+                fs = None
                 while True:
-                    fs = flags_menu(g, path.name)
+                    fs = flags_menu(g, path.name, fs)
                     v = version_menu(fs)
                     if v is not None:
                         break
@@ -2169,7 +2676,8 @@ def interactive_menu():
             else:
                 convert_file(path)
         except (OSError, ValueError, KeyError, IndexError, struct.error) as e:
-            print("转换失败:", e)
+            notice = f"转换失败：{e}"
+            print(_menu_color(notice, "red"))
 
 
 def main(argv=None):
